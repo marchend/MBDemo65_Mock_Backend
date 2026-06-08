@@ -1,0 +1,19 @@
+# deploy/local/docker-compose.yml — the LOCAL (develop) deploy target.
+# The self-hosted runner on your machine runs `docker compose -f this up -d`
+# on every merge to develop, bringing mbdemo65-mock-backend up at
+# http://localhost:8080.
+services:
+  mbdemo65-mock-backend:
+    image: ${IMAGE:-mbdemo65-mock-backend:local}
+    container_name: mbdemo65-mock-backend-develop
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-develop}
+      ORCHESTRATION_CLIENT: "${ORCHESTRATION_CLIENT:-mock}"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
