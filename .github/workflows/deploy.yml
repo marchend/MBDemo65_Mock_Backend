@@ -1,0 +1,128 @@
+name: Deploy
+
+# Config-driven deployment for mbdemo65-mock-backend. A merge landing on a release
+# branch resolves its environment from deploy/deploy.config.yml, picks the
+# runner the config names (self-hosted for a local target, ubuntu for cloud),
+# and deploys inside the matching GitHub Environment — so uat/prod approval
+# gates are enforced by the Environment, not bespoke workflow logic.
+#
+# This workflow is intentionally stack-agnostic: it reads deploy.config.yml at
+# run time, so retargeting an environment is a one-line edit to that file with
+# no change here.
+
+on:
+  push:
+    branches:
+      - 'develop'
+      - 'qa'
+      - 'uat'
+      - 'main'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to (re)deploy
+        type: choice
+        options: [develop, qa, uat, prod]
+
+concurrency:
+  # One deploy per branch at a time; never cancel an in-flight deploy.
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write        # push the image to GHCR (cloud targets)
+  deployments: write     # the environment: key records a GitHub deployment
+
+jobs:
+  resolve:
+    name: Resolve environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.map.outputs.environment }}
+      runs_on: ${{ steps.map.outputs.runs_on }}
+      target: ${{ steps.map.outputs.target }}
+      url: ${{ steps.map.outputs.url }}
+      profile: ${{ steps.map.outputs.profile }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          set -euo pipefail
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Resolve branch -> environment
+        id: map
+        run: |
+          set -euo pipefail
+          BRANCH="${{ github.event.inputs.environment || github.ref_name }}"
+          CFG=deploy/deploy.config.yml
+          # Match by environment .branch (push) or by key (workflow_dispatch).
+          ENV=$(yq -r ".environments | to_entries
+                 | map(select(.value.branch == \"$BRANCH\" or .key == \"$BRANCH\"))
+                 | .[0].key // \"\"" "$CFG")
+          if [[ -z "$ENV" || "$ENV" == "null" ]]; then
+            echo "::notice::No environment mapped to '$BRANCH' — nothing to deploy."
+            exit 0
+          fi
+          {
+            echo "environment=$ENV"
+            echo "runs_on=$(yq -o=json -I=0 ".environments.$ENV.runs_on" "$CFG")"
+            echo "target=$(yq -r ".environments.$ENV.target" "$CFG")"
+            echo "url=$(yq -r ".environments.$ENV.url" "$CFG")"
+            echo "profile=$(yq -r ".environments.$ENV.profile" "$CFG")"
+          } >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy
+    needs: resolve
+    if: needs.resolve.outputs.environment != ''
+    runs-on: ${{ fromJSON(needs.resolve.outputs.runs_on) }}
+    environment:
+      name: ${{ needs.resolve.outputs.environment }}
+      url: ${{ needs.resolve.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t mbdemo65-mock-backend:${{ github.sha }} .
+
+      # ── LOCAL target (develop, on your machine via a self-hosted runner) ──
+      - name: Deploy locally (docker compose)
+        if: needs.resolve.outputs.target == 'local'
+        env:
+          IMAGE: mbdemo65-mock-backend:${{ github.sha }}
+          SPRING_PROFILES_ACTIVE: ${{ needs.resolve.outputs.profile }}
+        run: |
+          docker compose -f deploy/local/docker-compose.yml up -d
+          echo "Deployed $IMAGE -> ${{ needs.resolve.outputs.url }}"
+
+      # ── CLOUD target (qa/uat/prod) ───────────────────────────────────────
+      - name: Push image + roll cloud
+        if: needs.resolve.outputs.target == 'cloud'
+        env:
+          REGISTRY: ghcr.io/${{ github.repository_owner }}/mbdemo65-mock-backend
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker tag mbdemo65-mock-backend:${{ github.sha }} "$REGISTRY:${{ github.sha }}"
+          docker push "$REGISTRY:${{ github.sha }}"
+          ./deploy/cloud/deploy.sh "${{ needs.resolve.outputs.environment }}" "$REGISTRY:${{ github.sha }}"
+
+      # ── Health gate (both targets) ───────────────────────────────────────
+      - name: Health check
+        run: |
+          set -euo pipefail
+          URL="${{ needs.resolve.outputs.url }}/actuator/health"
+          for i in $(seq 1 30); do
+            if curl -fsS "$URL" | grep -q '"status":"UP"'; then
+              echo "Healthy: $URL"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::${{ needs.resolve.outputs.environment }} did not become healthy at $URL"
+          exit 1
