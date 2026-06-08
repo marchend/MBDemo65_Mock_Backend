@@ -1,0 +1,15 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: acme-mock-backend
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false   # ISO-8601, not epoch millis
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
