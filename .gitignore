@@ -1,0 +1,3 @@
+# Added by MothershipCode — keep Gradle build output out of commits.
+.gradle/
+build/

@@ -7,6 +7,8 @@ spring:
   jackson:
     serialization:
       write-dates-as-timestamps: false   # ISO-8601, not epoch millis
+    generator:
+      write-bigdecimal-as-plain: true    # 4287.52 not 4.28752E+3
 
 management:
   endpoints:
